@@ -9,8 +9,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kadm" // New import for Kafka Admin API
+	"github.com/twmb/franz-go/pkg/kgo"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -21,7 +21,6 @@ import (
 	proxy_pkg "github.com/tnewman/kafka-proxy/pkg/proxy"
 
 	tc_kafka "github.com/testcontainers/testcontainers-go/modules/kafka"
-
 )
 
 func TestMessageProxy_Produce(t *testing.T) {
@@ -136,7 +135,7 @@ func TestMessageProxy_Produce(t *testing.T) {
 	// Create the topic before consuming
 	// NOTE: This is racy, but usually fine in tests. A better approach would be to use the Admin API.
 	time.Sleep(2 * time.Second) // Give producer time to create the topic
-	
+
 	fetches := verifyConsumer.PollFetches(ctx)
 	require.NoError(t, fetches.Err(), "failed to poll for fetches")
 
