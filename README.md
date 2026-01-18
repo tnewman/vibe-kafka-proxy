@@ -1,5 +1,10 @@
 # Kafka gRPC Proxy
 
+> [!CAUTION]
+> This project is not suitable for production. It was vibe-coded as an experiment to see if Gemini could 
+> pull off a technically complex project. Not a single line of code was written by a human outside of 
+> this warning. The code needs a thorough review and clean up.
+
 A high-performance gRPC proxy for Kafka that provides a simplified, message-oriented interface for producers and consumers. It abstracts Kafka-specific complexities like offset management and rebalancing, offering built-in flow control and dynamic client sharding.
 
 ## Purpose
