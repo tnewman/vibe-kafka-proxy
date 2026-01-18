@@ -270,39 +270,67 @@ func (c *Consumer) doCommit(ctx context.Context) {
 
 	for i := 0; i < maxCommitRetries; i++ {
 		c.mu.Lock()
-		offsetsToCommit := make(map[string]map[int32]int64)
-		for topic, partitions := range c.acknowledgedOffsets {
-			offsetsToCommit[topic] = make(map[int32]int64)
-			for partition, acknowledgedOffset := range partitions {
-				offsetsToCommit[topic][partition] = acknowledgedOffset + 1
-			}
-		}
-
-		if len(offsetsToCommit) == 0 {
+		if len(c.acknowledgedOffsets) == 0 {
 			c.mu.Unlock()
 			return // Nothing to commit
 		}
 
-		req := kmsg.NewOffsetCommitRequest()
-		for topic, partitions := range offsetsToCommit {
-			t := kmsg.NewOffsetCommitRequestTopic()
-			t.Topic = topic
-			for partition, offset := range partitions {
-				p := kmsg.NewOffsetCommitRequestTopicPartition()
-				p.Partition = partition
-				p.Offset = offset
-				p.Metadata = nil
-				t.Partitions = append(t.Partitions, p)
+		offsetsToCommitMap := make(map[string]map[int32]kgo.EpochOffset)
+		for topic, partitions := range c.acknowledgedOffsets {
+			offsetsToCommitMap[topic] = make(map[int32]kgo.EpochOffset)
+			for partition, acknowledgedOffset := range partitions {
+				// The offset to commit is the next expected offset, so acknowledgedOffset + 1
+				offsetsToCommitMap[topic][partition] = kgo.EpochOffset{Offset: acknowledgedOffset + 1, Epoch: -1}
 			}
-			req.Topics = append(req.Topics, t)
 		}
 		c.mu.Unlock()
 
-		// Send the request and wait for the response
-		future := c.client.RequestFuture(ctx, &req)
-		resp, err := future.Block() // Blocks until response is received or context is done
-		if err != nil {
-			c.logger.Error("Failed to send Kafka offset commit request", zap.Error(err), zap.Any("offsets", offsetsToCommit))
+		if len(offsetsToCommitMap) == 0 {
+			return // Should not happen if acknowledgedOffsets is not empty, but as a safeguard
+		}
+
+		commitDone := make(chan struct{})
+		var commitErr error
+		// Store successful commits in this map, to clear them from acknowledgedOffsets after the loop
+		committedSuccessfully := make(map[string]map[int32]struct{})
+
+		cb := func(_ *kgo.Client, req *kmsg.OffsetCommitRequest, resp *kmsg.OffsetCommitResponse, err error) {
+			defer close(commitDone)
+			if err != nil {
+				commitErr = err
+				c.logger.Error("Kafka offset commit request failed", zap.Error(err), zap.Any("request", req))
+				return
+			}
+
+			if resp != nil {
+				c.mu.Lock()
+				for _, rTopic := range resp.Topics {
+					for _, rPartition := range rTopic.Partitions {
+						if rPartition.ErrorCode != 0 { // 0 indicates no error
+							commitErr = fmt.Errorf("commit failed for %s-%d with error code %d", rTopic.Topic, rPartition.Partition, rPartition.ErrorCode)
+							c.logger.Error("Failed to commit Kafka offsets for partition",
+								zap.String("topic", rTopic.Topic),
+								zap.Int32("partition", rPartition.Partition),
+								zap.Error(fmt.Errorf("kafka error code: %d", rPartition.ErrorCode)),
+							)
+						} else {
+							// Mark as successfully committed
+							if _, ok := committedSuccessfully[rTopic.Topic]; !ok {
+								committedSuccessfully[rTopic.Topic] = make(map[int32]struct{})
+							}
+							committedSuccessfully[rTopic.Topic][rPartition.Partition] = struct{}{}
+						}
+					}
+				}
+				c.mu.Unlock()
+			}
+		}
+
+		c.client.CommitOffsets(ctx, offsetsToCommitMap, cb)
+		<-commitDone // Block until callback completes
+
+		if commitErr != nil { // Check for any error, including network errors or partition-specific errors
+			c.logger.Error("Failed to commit Kafka offsets", zap.Error(commitErr), zap.Any("offsets", offsetsToCommitMap))
 			if i < maxCommitRetries-1 {
 				time.Sleep(retryDelay)
 				retryDelay *= 2 // Exponential backoff
@@ -311,46 +339,24 @@ func (c *Consumer) doCommit(ctx context.Context) {
 			return // All retries failed
 		}
 
-		commitResp, ok := resp.(*kmsg.OffsetCommitResponse)
-		if !ok {
-			c.logger.Error("Received unexpected response type for OffsetCommitRequest", zap.Any("response", resp))
-			return // Should not happen
-		}
-
-		allCommitted := true
+		// If commit is successful, clear acknowledgedOffsets for *only* the successfully committed ones
 		c.mu.Lock()
-		for _, rTopic := range commitResp.Topics {
-			for _, rPartition := range rTopic.Partitions {
-				if rPartition.ErrorCode != kmsg.None {
-					allCommitted = false
-					c.logger.Error("Failed to commit Kafka offsets for partition",
-						zap.String("topic", rTopic.Topic),
-						zap.Int32("partition", rPartition.Partition),
-						zap.Error(fmt.Errorf("kafka error code: %d", rPartition.ErrorCode)),
-					)
-					// Do not clear acknowledgedOffsets for this failed partition
-				} else {
-					// Successfully committed for this partition, clear from acknowledgedOffsets
-					if c.acknowledgedOffsets[rTopic.Topic] != nil {
-						delete(c.acknowledgedOffsets[rTopic.Topic], rPartition.Partition)
-						if len(c.acknowledgedOffsets[rTopic.Topic]) == 0 {
-							delete(c.acknowledgedOffsets, rTopic.Topic)
-						}
-					}
+		for topic, partitions := range committedSuccessfully {
+			if c.acknowledgedOffsets[topic] != nil {
+				for partition := range partitions {
+					delete(c.acknowledgedOffsets[topic], partition)
+				}
+				if len(c.acknowledgedOffsets[topic]) == 0 {
+					delete(c.acknowledgedOffsets, topic)
 				}
 			}
 		}
 		c.mu.Unlock()
 
-		if allCommitted {
-			c.logger.Info("Successfully committed Kafka offsets", zap.Any("offsets", offsetsToCommit))
-			return // All committed, exit retry loop
-		}
-		c.logger.Warn("Partial Kafka offset commit failure, retrying...", zap.Int("attempt", i+1), zap.Any("offsets", offsetsToCommit))
-		time.Sleep(retryDelay)
-		retryDelay *= 2 // Exponential backoff
+		c.logger.Info("Successfully committed Kafka offsets", zap.Any("offsets", offsetsToCommitMap))
+		return // Commit successful, exit retry loop
 	}
-	c.logger.Error("Failed to commit Kafka offsets after multiple retries", zap.Any("offsets", offsetsToCommit))
+	c.logger.Error("Failed to commit Kafka offsets after multiple retries")
 }
 
 // Close shuts down the Kafka consumer.
