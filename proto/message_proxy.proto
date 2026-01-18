@@ -1,0 +1,62 @@
+syntax = "proto3";
+
+option go_package = "kafka-proxy/pkg/proxy";
+
+package message_proxy;
+
+// Produce RPC messages
+message ProduceRequest {
+  string client_message_id = 1; // Client-generated ID for correlation
+  string topic = 2;
+  bytes key = 3;
+  bytes value = 4;
+  repeated MessageHeader headers = 5;
+}
+
+message ProduceResponse {
+  string client_message_id = 1;
+  bool success = 2;
+  string error_message = 3; // Populated if success is false
+}
+
+// Consume RPC messages
+message ConsumeRequest {
+  oneof request_type {
+    SubscribeRequest subscribe = 1;
+    AckMessage ack = 2;
+  }
+}
+
+message SubscribeRequest {
+  string subscription = 1;
+  repeated string topics = 2;
+}
+
+message AckMessage {
+  string message_id = 1; // Server-generated ID from ConsumeResponse
+}
+
+message ConsumeResponse {
+  string message_id = 1; // Server-generated unique ID for this message
+  string topic = 2;
+  int32 partition = 3;
+  int64 offset = 4;
+  bytes key = 5;
+  bytes value = 6;
+  repeated MessageHeader headers = 7;
+}
+
+// Common message header structure
+message MessageHeader {
+  string key = 1;
+  bytes value = 2;
+}
+
+// MessageProxy service definition
+service MessageProxy {
+  // Bi-directional streaming RPC for producing messages
+  rpc Produce(stream ProduceRequest) returns (stream ProduceResponse);
+
+  // Bi-directional streaming RPC for consuming messages
+  rpc Consume(stream ConsumeRequest) returns (stream ConsumeResponse);
+}
